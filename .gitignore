@@ -1,0 +1,4 @@
+/build/
+*.o
+apv2
+*.apv2

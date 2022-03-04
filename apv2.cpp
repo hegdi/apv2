@@ -4,6 +4,8 @@
 #include <cassert>
 #include <cmath>
 #include <vector>
+#include <string>
+#include <filesystem>
 
 #include "sais.h"
 
@@ -14,7 +16,8 @@ static inline int log2i(int x) {
 }
 
 #define Q8TOF(x)    ((x)/256.f)
-#define FTOQ8(x)    ((int)((x)*256+0.5f))
+#define Q12TOF(x)    ((x)/4096.f)
+#define FTOQ8(x)    ((int)((x)*256.f+0.5f))
 
 template <unsigned NumBits, int (*get)(uint32_t*)>
 unsigned decode_bit_tree(uint32_t* probs)
@@ -85,7 +88,7 @@ public:
     {
         assert( nb <= 24 );
         assert( nb > 0 );
-        printf("encode: %x %d\n", val&((1<<nb)-1), nb);
+
         bits <<= nb;
         bits |= val&((1<<nb)-1);
         assert( (numbits+nb) <= 32 );
@@ -159,7 +162,6 @@ public:
         {
             unsigned bit = (symbol>>(NumBits-1)) & 1;
             symbol <<= 1;
-//            printf("enc context: %d\n", m);
             encode_bit( bit, &probs[m] );
             m = (m << 1) + bit;
         }
@@ -208,9 +210,6 @@ public:
 
         bits >>= nb;
         numbits -= nb;
-
-//        printf("decode: %x %d\n", got, nb);
-
         return got;
     }
 
@@ -255,7 +254,6 @@ public:
         unsigned m = 1;
         for (unsigned i = 0; i < NumBits; i++)
         {
-//            printf("context: %d\n", m);
             m = (m << 1) + decode_bit( &probs[m] );
         }
         return m - (1u << NumBits);
@@ -269,11 +267,11 @@ private:
     uint32_t r;
 };
 
-typedef uint8_t prob_t;
 
 #define APV2_INITIAL_PROP   FTOQ8(0.43f)
 class APV2 : private rABSDecode<256,32768,uint8_t>
 {
+    typedef uint8_t prob_t;
 public:
     APV2(const uint8_t *data) : rABSDecode( data ), lastOffset(0)
     {
@@ -290,21 +288,20 @@ public:
 
     void decompress( uint8_t *dest, size_t size )
     {
-        printf("%s\n", __FUNCTION__);
         uint8_t *ptr = dest;
-        for( int i=0; i<size; ++i )
+        for(; ptr<dest+size;)
         {
-            int8_t length = decode_bit_tree<8>( lengthModel );
-            printf("length: %3d ", length);
+            uint8_t length = decode_bit_tree<8>( lengthModel );
+//            printf("%5d length: %3d ", ptr-dest, length);
             if( length == 0 )
             {
                 uint8_t lit = decode_bit_tree<8>( literalModel );
                 *ptr++ = lit;
-                printf("lit: %02d\n", lit);
+//                printf("lit: %#04x\n", lit);
                 continue;
             }
-            int16_t offset = decode_bit_tree<12>( offsetModel );
-            printf("offset: %4d\n", offset);
+            uint16_t offset = decode_bit_tree<12>( offsetModel );
+//            printf("offset: %4d\n", offset);
             if( offset == 0 )
                 offset = lastOffset;
             lastOffset = offset;
@@ -326,24 +323,23 @@ private:
 
 };
 
-int16_t log2table[256] = { 0 };
+uint16_t log2table[256] = { 0 };
 
 void initQ8log2()
 {
     for( int i = 1; i<256; ++i )
     {
-        log2table[i] = log2( i/256.f )*256.f;
-    //    printf("%d - %d\n", i, log2table[i]);
+        log2table[i] = -log2( i/256.f )*4096.f+0.5f;
     }
 }
-int16_t Q8log2( uint8_t x )
+uint16_t Q8log2( uint8_t x )
 {
     return log2table[x];
 }
 
 class APV2Encode : public rABSEncoder<256,32768,uint8_t>
 {
-
+    typedef uint8_t prob_t;
 public:
     APV2Encode(uint8_t *data) : rABSEncoder( data ), lastOffset( 0 )
     {
@@ -379,16 +375,15 @@ private:
     prob_t literalModel[256];
     prob_t lengthModel[256];
     prob_t offsetModel[4096];
-    int lastOffset;
+    unsigned lastOffset;
 
 };
 
-template<typename T>
 class APV2Cost
 {
-
+    typedef uint8_t prob_t;
 public:
-    APV2Cost() : lastOffset( 0 ), price( SIZE_MAX ), link( -1 ), slot( -1 )
+    APV2Cost() : lastOffset( 0 )
     {
         for( int i=0; i<256; ++i )
         {
@@ -399,22 +394,23 @@ public:
         {
             offsetModel[i] = APV2_INITIAL_PROP;
         }
+        encode = { 0, 0 };
     }
 
-    int cost_bit( unsigned sym, T *probability )
+    int cost_bit( unsigned sym, prob_t *probability )
     {
-        T prob = *probability;
+        prob_t prob = *probability;
         *probability = adapt<256, 4>( sym, prob );
 
         // prob is for symbol 0
         if( !sym )
             prob = 256 - prob; // for symbol 1
 
-        return -Q8log2( prob );
+        return Q8log2( prob );
     }
 
     template<unsigned NumBits>
-    uint32_t cost_bit_tree(unsigned symbol, T *probs)
+    uint32_t cost_bit_tree(unsigned symbol, prob_t *probs)
     {
         uint32_t cost = 0;
         unsigned m = 1;
@@ -463,95 +459,364 @@ public:
         printf( "match> %d %d\n", encode.lenght, encode.offset );
     }
 
-    template<unsigned NUM_SLOTS>
-    void update_forward_arrival( APV2Cost cost_slot[][NUM_SLOTS], size_t p, size_t length, size_t offset )
-    {
-        size_t np = p + length;
-        for(uint8_t from_slot = 0; from_slot<NUM_SLOTS; ++from_slot )
-        {
-            // skip if no valid estimate for current slot
-            if( cost_slot[p][from_slot].price == SIZE_MAX )
-                break;
-
-            APV2Cost tmp = cost_slot[p][from_slot];
-            uint32_t match_cost = tmp.cost_match( length, offset );
-            if( cost_slot[np][NUM_SLOTS-1].price >
-                cost_slot[p][from_slot].price + match_cost )
-            {
-                tmp.price = cost_slot[p][from_slot].price + match_cost;
-                tmp.link = p;
-                tmp.slot = from_slot;
-                // update statistics, keep slots sorted by price
-                int slot;
-                for (slot = NUM_SLOTS - 2; (slot >= 0 && cost_slot[np][slot].price > tmp.price); slot--)
-                    cost_slot[np][slot + 1] = cost_slot[np][slot];
-                printf("from_slot: %d slot: %d\n", from_slot, slot+1);
-//                        printf("match slot: %d\n", slot);
-                cost_slot[np][slot+1] = tmp;
-            }
-        }
-
-    }
-
-    void update_forward_arrival( size_t p, uint8_t literal )
-    {
-
-    }
-
-    size_t price;
-    ssize_t link;
-    int8_t slot;
     struct {
         uint8_t lenght;
         uint16_t offset;
     } encode;
+    unsigned lastOffset;
 
+    static const int maxMatch = 255;
+    static const int minMatch = 1;
+    static const int maxOffset = 4095;
+    static const int minOffset = 1;
 private:
 
     prob_t literalModel[256];
     prob_t lengthModel[256];
     prob_t offsetModel[4096];
-    int lastOffset;
 
 };
 
-template<unsigned ARRAY_SIZE, typename T>
-void insert_sorted( APV2Cost<T> array[], APV2Cost<T> *key )
+template<typename C, unsigned NUM_SLOTS>
+class Forward_arrivals_parse
 {
-    int slot;
-    for (slot = ARRAY_SIZE - 2; (slot >= 0 && array[slot].price > key->price); slot--)
-        array[slot + 1] = array[slot];
-    array[slot+1] = *key;
-}
+    class Cost : public C {
+    public:
+        Cost() : price(SIZE_MAX), link( -1 ), slot( -1 ) {}
+        size_t price;
+        size_t link;
+        int_fast8_t slot;
+    };
+    Cost **costs;
 
+public:
+    Forward_arrivals_parse( uint8_t *ptr, size_t n ) : data( ptr ), dataSize( n )
+    {
+        costs = new Cost*[n+1];
+        for (size_t i = 0; i < n+1; ++i)
+            costs[i] = new Cost[NUM_SLOTS];
 
+        costs[0][0].price = 0;
+
+        SA = new int[n+1];
+        LCP = new int[n];
+        ISA = new int[n];
+
+        sais(data, SA, LCP, n );
+
+        for( size_t i=0; i<n; ++i )
+        {
+            ISA[SA[i]] = i;
+        }
+    }
+
+    ~Forward_arrivals_parse()
+    {
+        for( size_t i = 0; i<dataSize+1; ++i )
+            delete [] costs[i];
+        delete [] costs;
+
+        delete [] SA;
+        delete [] LCP;
+        delete [] ISA;
+    }
+
+    void find_slot( Cost array[], size_t s, Cost *key )
+    {
+        if( s == 0 ) // expand search from shortest arrival
+        for(unsigned slot = 0; slot<NUM_SLOTS; ++slot)
+        {
+            if( array[slot].price > key->price )
+            {
+                array[slot] = *key;
+                return;
+            }
+        }
+        else // collapse search from all others
+        {
+            for(int slot = s; slot>=0; slot--)
+            {
+                if(array[slot].price > key->price )
+                {
+                    array[slot] = *key;
+                    return;
+                }
+            }
+        }
+    }
+
+    void forward_arrival_literal( size_t p )
+    {
+        auto np = p+1;
+        for(unsigned from_slot = 0; from_slot<NUM_SLOTS; ++from_slot )
+        {
+            // skip of no valid estimate for current slot
+            if( costs[p][from_slot].price == SIZE_MAX )
+                break;
+
+            auto tmp = costs[p][from_slot];
+            auto literal_cost = tmp.cost_literal(data[p]);
+            tmp.price += literal_cost;
+            tmp.link = p;
+            tmp.slot = from_slot;
+
+            find_slot( costs[np], from_slot, &tmp );
+        }
+    }
+
+    void forward_arrival_match( size_t p, size_t length, size_t offset )
+    {
+        // match to far back
+        if( offset > Cost::maxOffset )
+            return;
+
+        auto np = p+length;
+
+        for(unsigned from_slot = 0; from_slot<NUM_SLOTS; ++from_slot )
+        {
+            // skip if no valid estimate for current slot
+            if( costs[p][from_slot].price == SIZE_MAX )
+                break;
+
+            auto tmp = costs[p][from_slot];
+            auto match_cost = tmp.cost_match( length, offset );
+            tmp.price += match_cost;
+            tmp.link = p;
+            tmp.slot = from_slot;
+
+            find_slot( costs[np], from_slot, &tmp );
+        }
+
+    }
+
+    size_t parse( void(*progress)(size_t p, size_t max)=NULL )
+    {
+        for( size_t p=0; p<dataSize; ++p )
+        {
+            // progress tracking if available
+            if( progress != NULL )
+                progress( p, dataSize );
+
+            forward_arrival_literal(p);
+
+            auto j = ISA[p];
+
+            auto lpsv = std::min<size_t>(Cost::maxMatch, dataSize-p);
+            auto lnsv = std::min<size_t>(Cost::maxMatch, dataSize-p);
+            for(size_t next=j+1, prev=j-1; (lpsv >= Cost::minMatch) || (lnsv >= Cost::minMatch);)
+            {
+                lpsv = (next>dataSize-1)?0:std::min<size_t>( LCP[next], lpsv );
+                lnsv = (prev<1)?0:std::min<size_t>( LCP[prev+1], lnsv );
+
+                if( (lpsv > 0) && (lpsv >= lnsv) )
+                {
+                    size_t m = SA[next];
+                    if( m < p )
+                    {
+                        auto length = lpsv;
+                        size_t offset = p-m;
+                        forward_arrival_match( p, length, offset );
+                    }
+                    if( next < dataSize )
+                        ++next;
+                }
+                if( (lnsv>0) && (lnsv >= lpsv) )
+                {
+                    size_t m = SA[prev];
+                    if( m < p )
+                    {
+                        auto length = lnsv;
+                        size_t offset = p-m;
+                        forward_arrival_match( p, length, offset );
+                    }
+                    if( prev > 0 )
+                        --prev;
+                }
+            }
+        }
+
+        size_t price = reverse();
+#if DEBUG_PARSE
+        size_t current = 1;
+        int slot_current = 0;
+        size_t lastOffset = 0;
+        for( int p=1; p<=dataSize; ++p )
+        {
+            printf("%8d: ", p );
+            for(auto from_slot = 0; from_slot<NUM_SLOTS; ++from_slot )
+            {
+                Cost *cost = &costs[p][from_slot];
+                // skip of no valid estimate for current slot
+                if( cost->price == SIZE_MAX )
+                    break;
+
+                int lenght = cost->encode.lenght;
+                int offset = cost->encode.offset;
+
+                char type = ' ';
+                if( lenght == 0 )
+                {
+//                    offset = 0;
+                }
+                if( cost->encode.lenght > 0 )
+                    type = 'M';
+                if(( cost->encode.lenght > 0 ) && (cost->encode.offset == 0 ))
+                {
+                    type = 'L';
+                    offset = cost->lastOffset;
+                }
+                if( (current == p) && (from_slot == slot_current) )
+                {
+                    printf("[%2d%c+%3d|%-2d] %d", lenght, type, offset,
+                            cost->slot, cost->price);//Q8TOF( cost->price ));
+
+                    current = cost->link;
+                    slot_current = cost->slot;
+                    lastOffset = cost->lastOffset;
+                }
+                else
+                printf(" %2d%c+%3d|%-2d  %d", lenght, type, offset,
+                        cost->slot, cost->price);//Q8TOF( cost->price ));
+
+            }
+            printf("\n");
+        }
+#endif
+        return price;
+    }
+
+    size_t reverse()
+    {
+        // find slot with minimum price
+        uint8_t slot_min = 0;
+        for(unsigned i=0; i<NUM_SLOTS; ++i)
+            if( costs[dataSize][i].price < costs[dataSize][slot_min].price )
+                slot_min = i;
+
+        // reverse links and slots
+        size_t prev = -1;
+        size_t current = dataSize;
+        size_t next = -1;
+        uint8_t slot_prev = -1;
+        uint8_t slot_current = slot_min;
+        uint8_t slot_next = -1;
+        while (current != SIZE_MAX) {
+            // Store next
+            next = costs[current][slot_current].link;
+            slot_next = costs[current][slot_current].slot;
+
+            // Reverse current node's pointer
+            costs[current][slot_current].link = prev;
+            costs[current][slot_current].slot = slot_prev;
+
+            // Move pointers one position ahead.
+            prev = current;
+            slot_prev = slot_current;
+            current = next;
+            slot_current = slot_next;
+        }
+        return costs[dataSize][slot_min].price;
+    }
+
+    template<typename T>
+    class iterator {
+    public:
+      iterator(T *c, size_t p, int_fast8_t slot): costs(c->costs), current(p), slot_current(slot) {}
+      iterator operator++()
+      {
+          auto next = costs[current][slot_current].link;
+          auto slot_next = costs[current][slot_current].slot;
+
+          current = next;
+          slot_current = slot_next;
+          return *this;
+      }
+      bool operator!=(const iterator & other) const { return (current != other.current) || (slot_current != other.slot_current); }
+      const typename T::Cost& operator*() const { return costs[current][slot_current]; }
+    private:
+      typename T::Cost **costs;
+      size_t current;
+      int_fast8_t slot_current;
+    };
+
+    auto begin() { return iterator( this, 1, 0 ); }
+    auto end() { return iterator( this, -1, -1 ); }
+
+private:
+
+    uint8_t *data;
+    size_t dataSize;
+
+    int* SA;
+    int* LCP;
+    int* ISA;
+
+};
 
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 
-void push_print_addr(bool, uint32_t *prob)
+void dump_to_file( const char *file, void* ptr, size_t size )
 {
-    printf("push> %p\n", prob);
+    FILE *fd = fopen( file, "wb" );
+    if(fd == NULL )
+    {
+        perror("can't open file");
+        return;
+    }
+    fwrite( ptr, size, 1, fd );
+    fclose( fd );
 }
 
-int pull_print_addr(uint32_t *prob)
+#include <signal.h>
+#include <sys/ioctl.h>
+unsigned COLS = 0;
+
+void adjust( int signum )
 {
-    printf("pull> %p\n", prob);
-    return 0;
+    (void)signum;
+    struct winsize sz;
+    ioctl( 0, TIOCGWINSZ, &sz );
+    COLS = sz.ws_col;
 }
+
+void print_progress(size_t count, size_t max)
+{
+    size_t bar_width = COLS-10;
+    bar_width = (bar_width > 100)?100:bar_width;
+#define PERCENTAGE(V, T) (V*100/T)
+    static char bar[100+1] = "";
+    size_t i;
+    for (i=0; i < bar_width; ++i)
+    {
+        bar[i] = i < PERCENTAGE(count, max) ? '=' : ' ';
+    }
+    bar[i] = 0;
+
+    printf("\e[2K\r|%s| %3.0f%%", bar, count*100.f/max);
+    if( count == max-1 )
+        printf("\n");
+    fflush(stdout);
+}
+
 
 int main( int argc, char *args[] )
 {
-    uint8_t buf[1024] = {0};
-    //uint8_t data[] = { 0x00, 0x00, 0x00, 0x00, 0x00 }; //0x12, 0x12, 0x12, 0x12, 0x12, 0x12}; //0x34, 0x56, 0xFF, 0xFF, 0x55, 0xF0};  //, 0x0F, 0x01, 0x02 };
-    uint8_t data[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
     if( argc < 2 )
     {
         printf("%s <filename>\n", args[0]);
         return EXIT_SUCCESS;
     }
+
+    adjust(0);
+    (void) signal(SIGWINCH, adjust);    /* arrange interrupts to resize */
+
+    std::string filename = std::filesystem::path(args[1]).stem();
+    filename += ".apv2";
+
+    printf("out file: %s\n", filename.c_str());
 
     initQ8log2();
 
@@ -563,7 +828,7 @@ int main( int argc, char *args[] )
         return EXIT_FAILURE;
     }
 
-    if (fstat(fd, &sb) == -1)           /* To obtain file size */
+    if (fstat(fd, &sb) < 0)           /* To obtain file size */
     {
         perror("can't get file size");
         return EXIT_FAILURE;
@@ -578,317 +843,38 @@ int main( int argc, char *args[] )
         return EXIT_FAILURE;
     }
 
-    int* SA = new int[n];
-    int* LCP = new int[n];
-    int* ISA = new int[n];
-
-    int r = sais(addr, SA, LCP, n );
-
-    for( size_t i=0; i<n; ++i )
+    Forward_arrivals_parse<APV2Cost, 16> parser(addr, n);
+    size_t compressedBits = parser.parse(print_progress);
+    size_t compressedBytes = compressedBits/(8*4096)+4;
+    uint8_t *outBuf = new uint8_t[compressedBytes];
+    APV2Encode encode(&outBuf[compressedBytes]);
+    printf("compressed size: %f\n", Q12TOF(compressedBits));
+    for( auto& i : parser )
     {
-        ISA[SA[i]] = i;
+//        printf("length: %3d offset: %4d\n", i.encode.lenght, i.encode.offset);
+        if( i.encode.lenght == 0 )
+            encode.encode_literal( i.encode.offset );
+        else
+            encode.encode_match( i.encode.lenght, i.encode.offset );
     }
-#if 0
-    for( size_t i=0; i<n; ++i )
-    {
-        printf("%d %s\n", LCP[i], &addr[SA[i]]);
-    }
-#endif
+    uint8_t *src = encode.flush();
+    size_t fileSize = &outBuf[compressedBytes]-src;
+    printf("compressed file size: %zu\n", fileSize );
+    dump_to_file( filename.c_str(), src, fileSize);
 
-#define NUM_SLOTS   4
-    APV2Cost<uint8_t> cost_slot[NUM_SLOTS][n+1];
-    cost_slot[0][0].price = 0;
-
-    for( size_t i=0; i<n; ++i )
-    {
-
-        size_t np = i+1;
-        for(uint8_t from_slot = 0; from_slot<NUM_SLOTS; ++from_slot )
-        {
-            // skip of no valid estimate for current slot
-            if( cost_slot[from_slot][i].price == SIZE_MAX )
-                break;
-
-            APV2Cost<uint8_t> tmp = cost_slot[from_slot][i];
-            uint32_t literal_cost = tmp.cost_literal(addr[i]);
-            if( cost_slot[NUM_SLOTS-1][np].price >
-                cost_slot[from_slot][i].price + literal_cost )
-            {
-                tmp.price = cost_slot[from_slot][i].price + literal_cost;
-                tmp.link = i;
-                tmp.slot = from_slot;
-                // update statistics
-                int slot;
-                for (slot = NUM_SLOTS - 2; (slot >= 0 && cost_slot[slot][np].price > tmp.price); slot--)
-                    cost_slot[slot + 1][np] = cost_slot[slot][np];
-                printf("literal slot: %d\n", slot);
-                cost_slot[slot+1][np] = tmp;
-            }
-        }
-
-        int j = ISA[i];
-        printf("=>%d %d\n", i, j);
-
-        int lpsv = n;
-        // forward scan for all matches
-        for( int k=j+1; k<n; ++k )
-        {
-            int l = LCP[k];
-            lpsv = std::min( l, lpsv );
-//            printf("lpsv: %d\n", lpsv);
-            if( lpsv < 1 )
-                break;
-
-            int m = SA[k];
-            if( m > i )
-                continue;
-
-            size_t lenght = lpsv;
-            size_t offset = i-m;
-            np = i+lenght;
-            printf("lenght: %d\noffset: %d\n", lenght, offset);
-//                printf("%d <-> %d\n", old_np, np);
-
-            for(uint8_t from_slot = 0; from_slot<NUM_SLOTS; ++from_slot )
-            {
-                // skip if no valid estimate for current slot
-                if( cost_slot[from_slot][i].price == SIZE_MAX )
-                    break;
-
-                APV2Cost<uint8_t> tmp = cost_slot[from_slot][i];
-                uint32_t match_cost = tmp.cost_match( lenght, offset );
-                if( cost_slot[NUM_SLOTS-1][np].price >
-                    cost_slot[from_slot][i].price + match_cost )
-                {
-                    tmp.price = cost_slot[from_slot][i].price + match_cost;
-                    tmp.link = i;
-                    tmp.slot = from_slot;
-                    // update statistics, keep slots sorted by price
-                    int slot;
-                    for (slot = NUM_SLOTS - 2; (slot >= 0 && cost_slot[slot][np].price > tmp.price); slot--)
-                        cost_slot[slot + 1][np] = cost_slot[slot][np];
-                    printf("from_slot: %d slot: %d\n", from_slot, slot+1);
-//                        printf("match slot: %d\n", slot);
-                    cost_slot[slot+1][np] = tmp;
-                }
-                printf("forward (%4d|%4d)\n", i-m, lpsv);
-            }
-        }
-
-        int lnsv = n;
-        // backward scan for all matches
-        for( int k=j-1; k>0; --k )
-        {
-            int l = LCP[k+1];
-            lnsv = std::min( l, lnsv );
-//            printf("lnsv: %d\n", lnsv);
-            if( lnsv < 1 )
-                break;
-
-            int m = SA[k];
-            if( m > i )
-                continue;
-
-            size_t lenght = lnsv;
-            size_t offset = i-m;
-            np = i+lenght;
-#if 1
-            for(uint8_t from_slot = 0; from_slot<NUM_SLOTS; ++from_slot )
-            {
-                // skip if no valid estimate for current slot
-                if( cost_slot[from_slot][i].price == SIZE_MAX )
-                    break;
-
-                APV2Cost<uint8_t> tmp = cost_slot[from_slot][i];
-                uint32_t match_cost = tmp.cost_match( lenght, offset );
-                if( cost_slot[NUM_SLOTS-1][np].price >
-                    cost_slot[from_slot][i].price + match_cost )
-                {
-                    tmp.price = cost_slot[from_slot][i].price + match_cost;
-                    tmp.link = i;
-                    tmp.slot = from_slot;
-                    // update statistics, keep slots sorted by price
-                    int slot;
-                    for (slot = NUM_SLOTS - 2; (slot >= 0 && cost_slot[slot][np].price > tmp.price); slot--)
-                        cost_slot[slot + 1][np] = cost_slot[slot][np];
-                    printf("from_slot: %d slot: %d\n", from_slot, slot+1);
-//                        printf("match slot: %d\n", slot);
-                    cost_slot[slot+1][np] = tmp;
-                }
-                printf("backward (%4d|%4d)\n", i-m, lnsv);
-//                    break;
-            }
-#endif
-        }
-    }
-
-//    APV2Cost<uint8_t> *cost = cost_slot[0];
-#if 0
-    uint8_t slot = 0;
-    for( int i=n; i>0;)
-    {
-        printf("%d> ", i );
-        for( int j=0; j<NUM_SLOTS; ++j )
-            printf("%1d -> %6.2f ", cost_slot[j][i].slot, Q8TOF(cost_slot[j][i].price));
-        printf("\n");
-        printf("%1d -> %6.2f\n", cost_slot[slot][i].slot, Q8TOF(cost_slot[slot][i].price));
-        uint8_t old_slot = slot;
-        slot = cost_slot[old_slot][i].slot;
-        i = cost_slot[old_slot][i].link;
-    }
-    printf("last slot: %d\n", slot);
-#endif
-
-    {
-        size_t current = n;
-        uint8_t slot_current = 0;
-        size_t next = -1;
-        size_t slot_next = -1;
-    while( current != -1 )
-    {
-//        printf("current: %d slot: %d\n", cost_slot[slot][i].link, slot);
-        next = cost_slot[slot_current][current].link;
-        slot_next = cost_slot[slot_current][current].slot;
-
-        printf("%2d -> %2d|%2d ", current, cost_slot[slot_current][current].link, cost_slot[slot_current][current].slot);
-        for( int j=0; j<NUM_SLOTS; ++j )
-            printf("[%2d|%2d] ", cost_slot[j][current].link, cost_slot[j][current].slot );
-        printf("\n");
-        cost_slot[slot_current][current].print_encoding();
-        current = next;
-        slot_current = slot_next;
-    }
-    }
-    // reverse links
-    size_t prev = -1;
-    size_t current = n;
-    size_t next = -1;
-    uint8_t slot_prev = -1;
-    uint8_t slot_current = 0;
-    uint8_t slot_next = -1;
-    while (current != -1) {
-        // Store next
-        next = cost_slot[slot_current][current].link;
-        slot_next = cost_slot[slot_current][current].slot;
-
-        // Reverse current node's pointer
-        cost_slot[slot_current][current].link = prev;
-        cost_slot[slot_current][current].slot = slot_prev;
-
-        // Move pointers one position ahead.
-        prev = current;
-        slot_prev = slot_current;
-        current = next;
-        slot_current = slot_next;
-    }
-
-    printf("after reversal %d\n", slot_prev);
-    APV2Encode encoder(&buf[1024]);
-
-    {
-        size_t current = 1;
-        uint8_t slot_current = 0;
-        size_t next = 0;
-        size_t slot_next = 0;
-        while( current != -1 )
-        {
-//        printf("current: %d slot: %d\n", cost_slot[slot][i].link, slot);
-            next = cost_slot[slot_current][current].link;
-            slot_next = cost_slot[slot_current][current].slot;
-
-            printf("%2d -> %2d|%2d ", current, cost_slot[slot_current][current].link, cost_slot[slot_current][current].slot);
-            for( int j=0; j<NUM_SLOTS; ++j )
-                printf("[%2d|%2d] ", cost_slot[j][current].link, cost_slot[j][current].slot );
-            printf("\n");
-            APV2Cost<uint8_t> *cost = &cost_slot[slot_current][current];
-
-            printf("encode: %d, %d\n", cost->encode.lenght, cost->encode.offset);
-            if( cost->encode.lenght == 0 )
-                encoder.encode_literal( cost->encode.offset );
-            else
-                encoder.encode_match( cost->encode.lenght, cost->encode.offset );
-            current = next;
-            slot_current = slot_next;
-        }
-    }
-    uint8_t *start = encoder.flush();
-
-    for( uint8_t *ptr=start; ptr<&buf[1024]; ++ptr )
-    {
-        printf("%02x, \n", *ptr);
-    }
-
-    APV2 decoder(start);
-    decoder.decompress( buf, 34 );
+    printf("verify... ");
+    uint8_t *verifyBuf = new uint8_t[n];
+    APV2 decode(src);
+    decode.decompress( verifyBuf, n );
     // force equality
-    for( int i=0; i<n; ++i )
+    for( size_t i=0; i<n; ++i )
     {
 //        printf("%c", buf[i]);
-        assert( buf[i]==addr[i]);
+        assert( verifyBuf[i]==addr[i]);
     }
-    uint8_t slot = slot_prev;
-    for( int i=1; i!=-1;)
-    {
-        printf("current: %d slot: %d\n", cost_slot[slot][i].link, slot);
-        printf("%d> ", i );
-        for( int j=0; j<NUM_SLOTS; ++j )
-            printf("%1d -> %6.2f ", cost_slot[j][i].slot, Q8TOF(cost_slot[j][i].price));
-        printf("\n");
-        printf("%1d -> %6.2f\n", cost_slot[slot][i].slot, Q8TOF(cost_slot[slot][i].price));
-        uint8_t old_slot = slot;
-        slot = cost_slot[old_slot][i].slot;
-        i = cost_slot[old_slot][i].link;
-    }
-
-
-    uint8_t probs[256];
-    for( int i=0; i<256; ++i )
-        probs[i] = 110;
-
-    rABSEncoder<256, 32768, uint8_t> out(&buf[1024]);
-
-    for( int j=0; j<sizeof(data); ++j )
-    {
-        out.encode_bit_tree<8>( data[j], probs );
-    }
-    start = out.flush();
-
-    printf("encoded:\n");
-    for( uint8_t *ptr=start; ptr<&buf[1024]; ++ptr )
-    {
-        printf("%02x, \n", *ptr);
-    }
-
-    for( int i=0; i<256; ++i )
-        probs[i] = 110;
-
-    rABSDecode<256, 32768, uint8_t> dec( start );
-
-
-    printf("decoded:\n");
-    for( int j=0; j<sizeof(data); j++ )
-    {
-        uint8_t value = dec.decode_bit_tree<8>( probs );
-        printf("%02x\n", value);
-    }
-
-    printf("cost encode:\n");
-    APV2Cost<uint8_t> cost;
-
-    for( int i=0; i<256; ++i )
-        probs[i] = 128;
-
-    size_t total = 0;
-    for( int j=0; j<sizeof(data); ++j )
-    {
-        total += cost.cost_bit_tree<8>( data[j], probs );
-        printf("%f\n", Q8TOF(total));
-    }
-    printf("total: %f\n", Q8TOF(total));
-    for( int i=0; i<256; ++i )
-        probs[i] = 255; //110;
-
-
+    printf("succeeded!\n");
+    delete [] verifyBuf;
+    delete [] outBuf;
 
     munmap(addr, sb.st_size);
     close(fd);

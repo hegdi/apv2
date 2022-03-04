@@ -1,11 +1,13 @@
 PROJECT_ROOT = $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 OBJS = apv2.o sais.o
+CFLAGS = -Wall -Wextra
+LDLIBS =
 
 ifeq ($(BUILD_MODE),debug)
-	CFLAGS += -g
+	CFLAGS += -Og -g3
 else ifeq ($(BUILD_MODE),run)
-	CFLAGS += -O2
+	CFLAGS += -Ofast
 else ifeq ($(BUILD_MODE),linuxtools)
 	CFLAGS += -g -pg -fprofile-arcs -ftest-coverage
 	LDFLAGS += -pg -fprofile-arcs -ftest-coverage
@@ -18,7 +20,7 @@ endif
 all:	apv2
 
 apv2:	$(OBJS)
-	$(CXX) $(LDFLAGS) -o $@ $^
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 	$(EXTRA_CMDS)
 
 %.o:	$(PROJECT_ROOT)%.cpp
