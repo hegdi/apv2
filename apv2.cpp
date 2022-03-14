@@ -9,39 +9,13 @@
 
 #include "sais.h"
 
-static inline int log2i(int x) {
-    assert(x > 0);
-
-    return sizeof(int) * 8 - __builtin_clz(x) - 1;
-}
+template <unsigned x>
+struct log2i { enum { value = 1 + log2i<x/2>::value }; };
+template <> struct log2i<1> { enum { value = 0 }; };
 
 #define Q8TOF(x)    ((x)/256.f)
 #define Q12TOF(x)    ((x)/4096.f)
 #define FTOQ8(x)    ((int)((x)*256.f+0.5f))
-
-template <unsigned NumBits, int (*get)(uint32_t*)>
-unsigned decode_bit_tree(uint32_t* probs)
-{
-    unsigned m = 1;
-    for (unsigned i = 0; i < NumBits; i++)
-    {
-        printf("%d\n", m);
-        m = (m << 1) + get( &probs[m] );
-    }
-    return m - (1u << NumBits);
-}
-
-template<unsigned NumBits, void (*put)(bool, uint32_t*)>
-void encode_bit_tree(unsigned symbol, uint32_t *probs)
-{
-    symbol |= 1u << NumBits;
-    do
-    {
-        unsigned bit = symbol & 1;
-        symbol >>= 1;
-        put( bit, &probs[symbol] );
-    } while( symbol >= 2 );
-}
 
 template<unsigned M, unsigned learning_rate>
 uint32_t adapt( unsigned bit, uint32_t prob )
@@ -74,7 +48,7 @@ uint32_t adapt( unsigned bit, uint32_t prob )
 }
 
 
-template<unsigned M, unsigned L, typename T>
+template<unsigned M, unsigned L, unsigned reNormBits, typename T>
 class rABSEncoder {
 
 public:
@@ -83,6 +57,40 @@ public:
         ptr = data-1;
         r = L;
     }
+
+    void encode_bit( unsigned symbol, T *probability )
+    {
+        T prob = *probability;
+        lifo.push_back( { (uint_least8_t)symbol, prob } );
+        *probability = adapt<M,4>( symbol, prob );
+    }
+
+    uint8_t *flush()
+    {
+        while( !lifo.empty() )
+        {
+            symbol_entry_t *e = &lifo.back();
+            T prob = e->prob;
+            _encode_bit( e->sym, prob );
+            lifo.pop_back();
+        }
+        return _flush();
+    }
+
+    template<unsigned NumBits>
+    void encode_bit_tree(unsigned symbol, T *probs)
+    {
+        unsigned m = 1;
+        for (unsigned i = 0; i < NumBits; i++)
+        {
+            unsigned bit = (symbol>>(NumBits-1)) & 1;
+            symbol <<= 1;
+            encode_bit( bit, &probs[m] );
+            m = (m << 1) + bit;
+        }
+    }
+
+private:
 
     void put(uint32_t val, int nb)
     {
@@ -104,32 +112,13 @@ public:
     uint8_t *_flush()
     {
         assert( numbits >= 0 && numbits < 8 );
-        put( r, 16 );
+        put( r, 24 );
         // byte align output bit stream
         int left = 7-numbits;
         put( 0, 1 );
         if( left > 0 )
             put( 0xFF, left );
         return ++ptr;
-    }
-
-    uint8_t *flush()
-    {
-        while( !lifo.empty() )
-        {
-            symbol_entry_t *e = &lifo.back();
-            T prob = e->prob;
-            _encode_bit( e->sym, prob );
-            lifo.pop_back();
-        }
-        return _flush();
-    }
-
-    void encode_bit( unsigned symbol, T *probability )
-    {
-        T prob = *probability;
-        lifo.push_back( { (uint_least8_t)symbol, prob } );
-        *probability = adapt<M,4>( symbol, prob );
     }
 
     void _encode_bit( unsigned symbol, T probability )
@@ -144,31 +133,16 @@ public:
 
         // renorm
         uint32_t x = r;
-        uint32_t x_max = ((L >> log2i(M)) << 1) * probability;
+        uint32_t x_max = ((L >> 8) << reNormBits) * probability;
         for(;x>=x_max;)
         {
-            put( x, 1 );
-            x >>= 1;
+            put( x, reNormBits );
+            x >>= reNormBits;
         }
 
-        r = ((x / probability) << log2i(M)) + (x % probability) + bias;
+        r = ((x / probability) << log2i<M>::value) + (x % probability) + bias;
     }
 
-    template<unsigned NumBits>
-    void encode_bit_tree(unsigned symbol, T *probs)
-    {
-        unsigned m = 1;
-        for (unsigned i = 0; i < NumBits; i++)
-        {
-            unsigned bit = (symbol>>(NumBits-1)) & 1;
-            symbol <<= 1;
-            encode_bit( bit, &probs[m] );
-            m = (m << 1) + bit;
-        }
-    }
-
-
-private:
     typedef struct {
         uint_least8_t sym;
         T prob;
@@ -183,7 +157,7 @@ private:
 };
 
 
-template<unsigned M, unsigned L, typename T>
+template<unsigned M, unsigned L, unsigned reNormBits, typename T>
 class rABSDecode {
 
 public:
@@ -192,25 +166,7 @@ public:
         ptr = data;
         // bit stream is byte aligned and starts with a 0 so skip 1's
         while( get(1) );
-        r = get( 16 );
-    }
-
-    uint32_t get(int nb)
-    {
-        assert( nb <= 24 );
-        assert( nb > 0 );
-
-        while (numbits < nb)
-        {
-            bits |= (*ptr++) << numbits;
-            numbits += 8;
-        }
-
-        uint32_t got = bits & ((1 << nb) - 1);
-
-        bits >>= nb;
-        numbits -= nb;
-        return got;
+        r = get( 24 );
     }
 
     // Input state x and probability for bit 1, output symbol and new state x'
@@ -237,11 +193,11 @@ public:
         *probability = adapt<M,4>( symbol, *probability );
 
         // Update state
-        x = prob * (x >> log2i(M)) + (x & (M - 1)) - bias;
+        x = prob * (x >> log2i<M>::value) + (x & (M - 1)) - bias;
 
         // Renormalize
         while( x < L ) {
-            x = (x << 1) | get(1);
+            x = (x << reNormBits) | get(reNormBits);
         }
 
         r = x;
@@ -260,6 +216,24 @@ public:
     }
 
 private:
+    uint32_t get(int nb)
+    {
+        assert( nb <= 24 );
+        assert( nb > 0 );
+
+        while (numbits < nb)
+        {
+            bits |= (*ptr++) << numbits;
+            numbits += 8;
+        }
+
+        uint32_t got = bits & ((1 << nb) - 1);
+
+        bits >>= nb;
+        numbits -= nb;
+        return got;
+    }
+
     uint32_t bits;
     int numbits;
     const uint8_t *ptr;
@@ -269,7 +243,7 @@ private:
 
 
 #define APV2_INITIAL_PROP   FTOQ8(0.43f)
-class APV2 : private rABSDecode<256,32768,uint8_t>
+class APV2 : private rABSDecode<256,32768,1,uint8_t>
 {
     typedef uint8_t prob_t;
 public:
@@ -337,7 +311,7 @@ uint16_t Q8log2( uint8_t x )
     return log2table[x];
 }
 
-class APV2Encode : public rABSEncoder<256,32768,uint8_t>
+class APV2Encode : public rABSEncoder<256,32768,1,uint8_t>
 {
     typedef uint8_t prob_t;
 public:
@@ -845,10 +819,10 @@ int main( int argc, char *args[] )
 
     Forward_arrivals_parse<APV2Cost, 16> parser(addr, n);
     size_t compressedBits = parser.parse(print_progress);
-    size_t compressedBytes = compressedBits/(8*4096)+4;
+    printf("compressed size: %f\n", Q12TOF(compressedBits));
+    size_t compressedBytes = compressedBits/(8*4096)+3+1+1;
     uint8_t *outBuf = new uint8_t[compressedBytes];
     APV2Encode encode(&outBuf[compressedBytes]);
-    printf("compressed size: %f\n", Q12TOF(compressedBits));
     for( auto& i : parser )
     {
 //        printf("length: %3d offset: %4d\n", i.encode.lenght, i.encode.offset);
@@ -859,7 +833,7 @@ int main( int argc, char *args[] )
     }
     uint8_t *src = encode.flush();
     size_t fileSize = &outBuf[compressedBytes]-src;
-    printf("compressed file size: %zu\n", fileSize );
+    printf("compressed file size: %zu %zu\n", fileSize, compressedBytes );
     dump_to_file( filename.c_str(), src, fileSize);
 
     printf("verify... ");
