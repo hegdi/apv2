@@ -1,0 +1,16 @@
+diff --git a/esa_matchfinder.h b/esa_matchfinder.h
+index d2f0d87..6bd5982 100644
+--- a/esa_matchfinder.h
++++ b/esa_matchfinder.h
+@@ -24,9 +24,9 @@ Please see the file LICENSE for full copyright and license details.
+ #ifndef ESA_MATCHFINDER_H
+ #define ESA_MATCHFINDER_H 1
+ 
+-#define ESA_MATCHFINDER_MATCH_BITS          (6)
++#define ESA_MATCHFINDER_MATCH_BITS          (8)
+ #define ESA_MATCHFINDER_MAX_BLOCK_SIZE      (1 << ((64 - ESA_MATCHFINDER_MATCH_BITS) / 2))
+-#define ESA_MATCHFINDER_MIN_MATCH_LENGTH    (2)
++#define ESA_MATCHFINDER_MIN_MATCH_LENGTH    (1)
+ #define ESA_MATCHFINDER_MAX_MATCH_LENGTH    (1 << ESA_MATCHFINDER_MATCH_BITS)
+ 
+ #define ESA_MATCHFINDER_NO_ERROR            (0)

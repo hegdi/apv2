@@ -1,4 +1,3 @@
-/build/
-*.o
-apv2
+build
+3rdparty
 *.apv2
