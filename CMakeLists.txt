@@ -78,7 +78,7 @@ endif()
 
 find_package(Git REQUIRED)
 
-add_executable(${PROJECT_NAME} apv2.cpp APV2.cpp matchfinder.c version.h)
+add_executable(${PROJECT_NAME} main.cpp APV2.cpp matchfinder.c version.h)
 target_link_libraries(${PROJECT_NAME} bsd)
 target_link_libraries(${PROJECT_NAME} libesa_matchfinder)
 
