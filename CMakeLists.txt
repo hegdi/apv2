@@ -64,28 +64,18 @@ endif()
 include(CheckIPOSupported)
 check_ipo_supported(RESULT result OUTPUT output)
 if(result)
+  message(STATUS "IPO enabled")
   set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
 else()
   message(WARNING "IPO is not supported: ${output}")
 endif()
 
-find_package(Boost 1.83.0 CONFIG REQUIRED)
-if(Boost_FOUND)
-    include_directories(${Boost_INCLUDE_DIRS})
-else()
-    message(SEND_ERROR "Boost intrusive missing")
-endif()
-
 find_package(Git REQUIRED)
 
-add_executable(${PROJECT_NAME} main.cpp APV2.cpp matchfinder.c version.h)
-target_link_libraries(${PROJECT_NAME} bsd)
-target_link_libraries(${PROJECT_NAME} libesa_matchfinder)
+find_package(boost_headers REQUIRED CONFIG)
 
 # Create a version header
 configure_file(version.h.in version.h @ONLY)
-# Include the version header in the build
-target_include_directories(${PROJECT_NAME} PUBLIC "${PROJECT_BINARY_DIR}")
 
 FetchContent_Declare(esa_matchfinder_external
                     GIT_REPOSITORY "https://github.com/IlyaGrebnov/esa-matchfinder.git"
@@ -101,4 +91,5 @@ include_directories(${esa_matchfinder_INCLUDE_DIRS})
 add_library(libesa_matchfinder OBJECT )
 target_sources( libesa_matchfinder PRIVATE "${esa_matchfinder_SOURCE_DIRS}/esa_matchfinder.c" "${esa_matchfinder_SOURCE_DIRS}/libsais/libsais.c" )
 
-target_link_libraries(${PROJECT_NAME} libesa_matchfinder)
+add_subdirectory(src)
+

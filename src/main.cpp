@@ -34,8 +34,8 @@
 #include <cassert>
 #include <cinttypes>
 #include <filesystem>
-#include <bsd/bsd.h>
 #include <fcntl.h>
+#include <getopt.h>
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -44,6 +44,8 @@
 
 #include "APV2.h"
 #include "Forward_arrivals_parse.h"
+#include "humanize_number.h"
+#include "progress_bar.h"
 #include "version.h"
 
 static void dump_to_file( const char *file, const void* ptr, size_t size )
@@ -89,56 +91,7 @@ static void unmap_file( void *addr, size_t len )
     munmap(addr, len);
 }
 
-static unsigned COLS = 0;
-
-static void adjust( int signum )
-{
-    (void)signum;
-    struct winsize sz;
-    ioctl( 0, TIOCGWINSZ, &sz );
-    COLS = sz.ws_col;
-}
-
-static const char style[] = "[= ]";
-#define SPINNER_SIZE 4
-static const char spinner[SPINNER_SIZE+1] = "|/-\\";
-enum {
-	BAR_START    = 0,
-	BAR_PROGRESS = 1,
-	BAR_EMPTY    = 2,
-	BAR_END      = 3
-};
-static void print_progress(size_t count, size_t max, size_t poolLevel, size_t poolSize)
-{
-	char remainingBytes[8];
-	const char *Unit = "B";
-	humanize_number( remainingBytes, sizeof(remainingBytes), poolLevel, Unit, HN_AUTOSCALE, 0);
-	char poolSizeBytes[8];
-	humanize_number( poolSizeBytes, sizeof(poolSizeBytes), poolSize, Unit, HN_AUTOSCALE, 0);
-
-	unsigned bar_width = COLS-28;
-    bar_width = std::min(bar_width, 100u);
-#define PERCENTAGE(V, T) (V*100/T)
-    static char bar[100+1] = "";
-    unsigned i;
-    for (i=0; i < bar_width; ++i) {
-        bar[i] = i < PERCENTAGE(count, max) ? style[BAR_PROGRESS] : style[BAR_EMPTY];
-    }
-    bar[i] = 0;
-
-    static int spin = 0;
-    spin++;
-    spin %= SPINNER_SIZE;
-
-    printf("\e[2K\r%c%c%c%c%s%c %3d%% %8s %8s", style[BAR_START], spinner[spin], style[BAR_END], style[BAR_START], bar, style[BAR_END], (uint8_t)PERCENTAGE(count, max), remainingBytes, poolSizeBytes);
-    if( count == max ) {
-        printf("\e[2K\r");
-    }
-    fflush(stdout);
-}
-
 static const char short_options[] = "dp:vVh";
-
 static const struct option long_options[] = {
     {"decompress",       no_argument, NULL, 'd'},
     {"pool_size",  required_argument, NULL, 'p'},
@@ -210,8 +163,6 @@ int main( int argc, char *args[] )
         fprintf(stderr, "%s: pool size needs to be greater than zero.\n", args[0]);
         return EXIT_FAILURE;
     }
-    adjust(0);
-    (void) signal(SIGWINCH, adjust);    /* arrange interrupts to resize */
 
     char poolSizeBytes[8];
     const char *Unit = "B";
@@ -248,7 +199,7 @@ int main( int argc, char *args[] )
         size_t outFileSize = 0;
         if( !decompress ) { // Compress
             typedef Forward_arrivals_parse<APV2Cost> APV2_parser;
-            APV2_parser parser(addr, inFileSize, pool_size/sizeof(APV2Cost)+1);  // 60 32GB
+            APV2_parser parser(addr, inFileSize, pool_size/sizeof(APV2Cost)+1);
             APV2_parser::progress_callback_t progress = NULL;
             if( verbose ) {
                 progress = print_progress;
