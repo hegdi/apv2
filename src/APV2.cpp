@@ -31,10 +31,9 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <cmath>
 #include "APV2.h"
 
-uint32_t log2table[256] = {
+static const uint32_t log2table[256] = {
          0, 524288, 458752, 420416, 393216, 372118, 354880, 340305,
     327680, 316544, 306582, 297571, 289344, 281776, 274769, 268246,
     262144, 256412, 251008, 245896, 241046, 236433, 232035, 227832,
@@ -69,26 +68,7 @@ uint32_t log2table[256] = {
       3002,   2621,   2242,   1865,   1489,   1115,    742,    370
 };
 
-uint32_t log2i(const uint32_t x) {
-    if( x == 0 ) {
-        return 0;
-    }
-    return (31 - __builtin_clz (x));
-}
-
 uint32_t Qlog2( uint8_t x ) {
     return log2table[x];
-}
-
-void init_log2_table() {
-    for( int i=1; i<256; ++i ) {
-        log2table[i] = log2(256./i)*((double)QFACTOR)+0.5;
-    }
-}
-
-size_t apv2_decoder_get_data_len(const void *src, size_t ssize) {
-    APV2 apv2;
-    apv2.decompress(NULL, src, ssize);
-    return apv2.get_data_len();
 }
 

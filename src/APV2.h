@@ -54,9 +54,6 @@
 #define QFACTOR (UINT32_C(1)<<16)
 #define QTOF(x) ((x)/((float)QFACTOR))
 
-extern uint32_t log2table[256];
-uint32_t log2i(const uint32_t x);
-void init_log2_table();
 uint32_t Qlog2( uint8_t x );
 
 class APV2 : private rABSBitDecoder<APV2_M, APV2_L, APV2_b, uint8_t, APV2_learning_rate> {
@@ -320,8 +317,6 @@ private:
     prob_t lengthModel[256];
     prob_t offsetModel[4096];
 };
-
-size_t apv2_decoder_get_data_len(const void *src, size_t ssize);
 
 template <class Parser>
 void apv2_encode_parse( void *dest, size_t dsize, Parser& parse ) {
