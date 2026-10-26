@@ -59,6 +59,11 @@ template <unsigned x>
 struct static_log2i { enum { value = 1 + static_log2i<x/2>::value }; };
 template <> struct static_log2i<1> { enum { value = 0 }; };
 
+// thrown as soon as the bit stream runs dry or decodes a token that a
+// valid stream cannot produce; the input is not a valid rABS/APV2 stream
+struct rABS_error {
+};
+
 template<unsigned M, unsigned L, unsigned reNormBits, typename T, unsigned learning_rate>
 class rABSBitEncoder {
 
@@ -295,6 +300,11 @@ private:
         assert( nb > 0 );
 
         while (numbits < nb) {
+            if( ptr >= end ) {
+                // running dry makes the input invalid - report it at the
+                // spot instead of reading past the end
+                throw rABS_error();
+            }
             bits |= (uint64_t)(*ptr++) << numbits;
             numbits += 8;
         }

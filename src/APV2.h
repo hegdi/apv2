@@ -65,6 +65,8 @@ public:
     APV2() : lastOffset(0), len(0) {
     }
 
+    // decompress a full APV2 stream; throws rABS_error when the input is
+    // not a valid stream (runs dry or decodes an impossible token)
     size_t decompress( void *dest, const void *src, size_t size ) {
         decoder_init( (uint8_t*)src, size );
         for( int i=0; i<256; ++i ) {
@@ -77,15 +79,15 @@ public:
         lastOffset = 0;
         len = 0;
         uint8_t *ptr = (uint8_t*)dest;
+        size_t written = 0;
         for(; decoder_done();) {
             uint8_t length = decode_bit_tree<8>( lengthModel );
             if( length == 0 ) {
                 uint8_t lit = decode_bit_tree<8>( literalModel );
                 if( ptr != NULL ) {
                     *ptr++ = lit;
-                } else {
-                    ++len;
                 }
+                ++written;
                 continue;
             }
 
@@ -93,19 +95,27 @@ public:
             if( offset == 0 ) {
                 offset = lastOffset;
             }
+            // a match can only copy bytes that are already there; a valid
+            // stream guarantees this, a corrupt one may point before the
+            // destination start
+            if( (offset == 0) || (written < (size_t)offset) ) {
+                throw rABS_error();
+            }
             lastOffset = offset;
 
             // copy from destination
             for(; length>0; --length) {
                 if( ptr != NULL ) {
-                    *ptr = ptr[-lastOffset];
+                    *ptr = ptr[-offset];
                     ++ptr;
-                } else {
-                    ++len;
                 }
+                ++written;
             }
         }
-        return ptr-(uint8_t*)dest;
+        if( ptr == NULL ) {
+            len = written;
+        }
+        return written;
     }
 
     size_t get_data_len() {
