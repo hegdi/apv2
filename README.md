@@ -25,12 +25,25 @@ Thanks to @emmanuel-marty for his work, as this is basically a simplified versio
 parser and of course @IlyaGrebnov for all about suffix array construction.
 
 # build
+Requires a C++17 compiler, CMake >= 3.27 and Boost headers.
+The CLI uses nothing but the C++ standard library, so Windows, Linux and
+macOS build from the same sources.
 ```sh
-> cmake -B build
-> make -C build
+> cmake -B build -DCMAKE_BUILD_TYPE=Release
+> cmake --build build
 ```
 
 # usage
 ```sh
-> ./apv2 <filename>
+> ./build/src/apv2 [OPTION]... FILE...
+
+  -d, --decompress   decompress (file.apv2 -> file)
+  -f, --force        overwrite output file if it exists
+  -s, --max-slots N  parser candidate slots per position (default 61)
+  -v, --verbose      report progress
+  -V, --version      print version and exit
+  -h, --help         print this help and exit
 ```
+Works gzip-style: `apv2 file` produces `file.apv2`, `apv2 -d file.apv2`
+restores `file` and refuses to overwrite it unless `-f` is given.
+A copy or symlink called `unapv2` defaults to decompression.

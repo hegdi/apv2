@@ -12,6 +12,13 @@ message(STATUS "version-full: ${PROJECT_GIT_VERSION_FULL}")
 project (apv2
 	VERSION ${PROJECT_VERSION}
 	DESCRIPTION "high compression rate algorithm with low system requirements")
+
+# portable std::filesystem use needs C++17 (MSVC does not default to it)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
 # extra compiler warnings
 if (CMAKE_C_COMPILER_ID MATCHES ".*Clang.*")
 	# using Clang

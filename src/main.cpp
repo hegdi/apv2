@@ -31,209 +31,398 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <cassert>
-#include <cinttypes>
+/*
+ * The command line is built on nothing but the C++ standard library so the
+ * same source builds unchanged on Windows, Linux and macOS.
+ */
+
+#include <cstdint>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
-#include <fcntl.h>
-#include <getopt.h>
-#include <signal.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include <fstream>
+#include <new>
+#include <string>
+#include <vector>
 
 #include "APV2.h"
 #include "Forward_arrivals_parse.h"
-#include "humanize_number.h"
 #include "progress_bar.h"
 #include "version.h"
 
-static void dump_to_file( const char *file, const void* ptr, size_t size )
-{
-    FILE *fd = fopen( file, "wb" );
-    if(fd == NULL ) {
-        perror("can't open file");
-        return;
-    }
-    fwrite( ptr, size, 1, fd );
-    fclose( fd );
-}
+namespace fs = std::filesystem;
 
-static uint8_t *mmap_file( const char *file, size_t *len )
-{
-    struct stat sb;
-    int fd = open(file, O_RDONLY);
-    if (fd < 0) {
-        perror("can't open file");
-        return NULL;
-    }
+typedef Forward_arrivals_parse<APV2Cost> APV2_parser;
 
-    if (fstat(fd, &sb) < 0) { /* To obtain file size */
-        perror("can't get file size");
-        close(fd);
-        return NULL;
-    }
-    size_t fileSize = sb.st_size;
-    *len = fileSize;
-    assert( fileSize <= INT32_MAX );
-
-    uint8_t *addr = (uint8_t*)mmap(NULL, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if( addr == MAP_FAILED ) {
-        perror("can't mmap file");
-        return NULL;
-    }
-    return addr;
-}
-
-static void unmap_file( void *addr, size_t len )
-{
-    munmap(addr, len);
-}
-
-static const char short_options[] = "dp:vVh";
-static const struct option long_options[] = {
-    {"decompress",       no_argument, NULL, 'd'},
-    {"pool_size",  required_argument, NULL, 'p'},
-    {"verbose",          no_argument, NULL, 'v'},
-    {"version",          no_argument, NULL, 'V'},
-    {"help",             no_argument, NULL, 'h'},
-    {NULL,                         0, NULL,  0 },
-};
-
-static const char *help_options[] = {
-    "decompress",
-    "initial edge pool size in MB",
-    "verbose mode",
-    "display version number",
-    "give this help",
-};
+#define INITIAL_POOL_BYTES (1024 * 1024) /* the parser pool grows dynamically from this size */
+#define MAX_INPUT_SIZE (INT32_MAX)   /* the matchfinder works on int32 sizes */
 
 static void print_version()
 {
-    printf("%s Copyright (C) 2022 Dirk Helbig\n", apv2_VERSION);
+    printf("apv2 %s Copyright (C) 2022 Dirk Helbig\n", apv2_VERSION);
 }
 
-static void usage(std::filesystem::path file)
+static void usage(FILE *out, const char *argv0)
 {
-    const char *filename = file.filename().c_str();
-    printf("%s ", filename);
-    print_version();
-    printf("Usage: %s [OPTION]... [FILE]...\n", filename);
-    printf("Compress or decompress FILEs (by default, compress FILES in-place).\n");
-    for( int i=0; long_options[i].name != 0; i++) {
-        printf("--%s|-%c\t\t%s\n", long_options[i].name, long_options[i].val, help_options[i] );
+    fprintf(out, "Usage: %s [OPTION]... FILE...\n", argv0);
+    fprintf(out, "Compress FILEs gzip-style (file -> file.apv2), decompress with -d.\n\n");
+    fprintf(out, "  -d, --decompress   decompress (file.apv2 -> file)\n");
+    fprintf(out, "  -f, --force        overwrite output file if it exists\n");
+    fprintf(out, "  -s, --max-slots N  parser candidate slots per position, 1..%d (default %d)\n",
+            INT32_MAX, DEFAULT_MAX_SLOTS);
+    fprintf(out, "  -v, --verbose      report progress\n");
+    fprintf(out, "  -V, --version      print version and exit\n");
+    fprintf(out, "  -h, --help         print this help and exit\n");
+    fprintf(out, "\nInvoked as \"unapv2\" (copy or symlink), decompression is the default.\n");
+}
+
+static bool parse_max_slots(const char *value, int &maxSlots)
+{
+    errno = 0;
+    char *end = NULL;
+    long long parsed = strtoll(value, &end, 10);
+    while( *end == ' ' ) ++end;
+    if( errno == ERANGE || *end != '\0' || parsed < 1 || parsed > INT32_MAX ) {
+        fprintf(stderr, "apv2: invalid slot count '%s' (need an integer from 1 to %d)\n",
+                value, INT32_MAX);
+        return false;
     }
+    maxSlots = (int)parsed;
+    return true;
+}
+
+static bool long_option_matches(const char *name, const char *option, const char **value)
+{
+    size_t len = strlen(option);
+    if( strncmp(name, option, len) != 0 ) {
+        return false;
+    }
+    if( name[len] == '\0' ) {
+        *value = NULL;
+        return true;
+    }
+    if( name[len] == '=' ) {
+        *value = name + len + 1;
+        return true;
+    }
+    return false;
+}
+
+struct Options {
+    bool decompress = false;
+    bool force = false;
+    bool verbose = false;
+    int maxSlots = DEFAULT_MAX_SLOTS;
+};
+
+/*
+ * Small hand-written parser instead of getopt_long(), which does not exist on
+ * Windows. Options may be combined (-dv), long options take --opt=value.
+ * Parsing stops at the first non-option; the rest are the input files.
+ */
+static bool parse_args(int argc, char *args[], Options &opt, int &firstFile)
+{
+    firstFile = argc;
+    for( int i=1; i<argc; ++i ) {
+        const char *arg = args[i];
+        if( arg[0] != '-' || arg[1] == '\0' ) {
+            firstFile = i;
+            return true;
+        }
+        if( arg[1] == '-' ) {
+            if( strcmp(arg, "--") == 0 ) {
+                firstFile = i+1;
+                return true;
+            }
+            const char *name = arg+2;
+            const char *value = NULL;
+            if( long_option_matches(name, "decompress", &value) ) {
+                opt.decompress = true;
+            } else if( long_option_matches(name, "force", &value) ) {
+                opt.force = true;
+            } else if( long_option_matches(name, "verbose", &value) ) {
+                opt.verbose = true;
+            } else if( long_option_matches(name, "version", &value) ) {
+                print_version();
+                exit(EXIT_SUCCESS);
+            } else if( long_option_matches(name, "help", &value) ) {
+                usage(stdout, args[0]);
+                exit(EXIT_SUCCESS);
+            } else if( long_option_matches(name, "max-slots", &value) ) {
+                if( value == NULL ) {
+                    if( i+1 >= argc ) {
+                        fprintf(stderr, "apv2: option '--max-slots' requires an argument\n");
+                        return false;
+                    }
+                    value = args[++i];
+                }
+                if( !parse_max_slots(value, opt.maxSlots) ) {
+                    return false;
+                }
+            } else {
+                fprintf(stderr, "apv2: unrecognized option '%s'\n", arg);
+                usage(stderr, args[0]);
+                return false;
+            }
+        } else {
+            for( const char *c = arg+1; *c != '\0'; ++c ) {
+                switch( *c ) {
+                case 'd':
+                    opt.decompress = true;
+                    break;
+                case 'f':
+                    opt.force = true;
+                    break;
+                case 'v':
+                    opt.verbose = true;
+                    break;
+                case 'V':
+                    print_version();
+                    exit(EXIT_SUCCESS);
+                case 'h':
+                    usage(stdout, args[0]);
+                    exit(EXIT_SUCCESS);
+                case 's':
+                    if( i+1 >= argc ) {
+                        fprintf(stderr, "apv2: option requires an argument -- 's'\n");
+                        return false;
+                    }
+                    if( !parse_max_slots(args[++i], opt.maxSlots) ) {
+                        return false;
+                    }
+                    break;
+                default:
+                    fprintf(stderr, "apv2: invalid option -- '%c'\n", *c);
+                    usage(stderr, args[0]);
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static bool read_file(const fs::path &name, std::vector<uint8_t> &buffer)
+{
+    std::string what = name.string();
+    std::error_code ec;
+    if( fs::is_directory(name, ec) ) {
+        fprintf(stderr, "apv2: %s: is a directory\n", what.c_str());
+        return false;
+    }
+    uintmax_t size = fs::file_size(name, ec);
+    if( ec ) {
+        fprintf(stderr, "apv2: %s: cannot open input\n", what.c_str());
+        return false;
+    }
+    if( size > MAX_INPUT_SIZE ) {
+        fprintf(stderr, "apv2: %s: file too large (max %lu bytes)\n",
+                what.c_str(), (unsigned long)MAX_INPUT_SIZE);
+        return false;
+    }
+    std::ifstream in(name, std::ios::binary);
+    if( !in ) {
+        fprintf(stderr, "apv2: %s: cannot open input\n", what.c_str());
+        return false;
+    }
+    buffer.resize((size_t)size);
+    if( size > 0 && !in.read((char *)buffer.data(), (std::streamsize)size) ) {
+        fprintf(stderr, "apv2: %s: failed reading input\n", what.c_str());
+        return false;
+    }
+    return true;
+}
+
+static bool check_output_free(const fs::path &name, bool force)
+{
+    std::error_code ec;
+    if( !force && fs::exists(name, ec) ) {
+        fprintf(stderr, "apv2: %s already exists. Use -f to overwrite.\n", name.string().c_str());
+        return false;
+    }
+    return true;
+}
+
+static bool write_file(const fs::path &name, const void *ptr, size_t size)
+{
+    std::string what = name.string();
+    std::ofstream out(name, std::ios::binary | std::ios::trunc);
+    if( !out ) {
+        fprintf(stderr, "apv2: %s: cannot open output\n", what.c_str());
+        return false;
+    }
+    if( size > 0 && !out.write((const char *)ptr, (std::streamsize)size) ) {
+        fprintf(stderr, "apv2: %s: failed writing output\n", what.c_str());
+        return false;
+    }
+    out.close();
+    if( !out.good() ) {
+        fprintf(stderr, "apv2: %s: failed writing output\n", what.c_str());
+        return false;
+    }
+    return true;
+}
+
+static bool compress_file(const fs::path &inFile, const fs::path &outFile,
+                          const Options &opt,
+                          APV2_parser::progress_callback_t progress)
+{
+    std::string what = inFile.string();
+    std::vector<uint8_t> in;
+    if( !read_file(inFile, in) ) {
+        return false;
+    }
+    if( !check_output_free(outFile, opt.force) ) {
+        return false;
+    }
+
+    std::vector<uint8_t> out;
+    double bits = 0;
+    try {
+        if( in.empty() ) {
+            // no tokens at all: flushing the untouched coder decodes back to zero bytes
+            // (the coder writes backwards, so hand it the end of the buffer)
+            APV2Encode empty(NULL);
+            empty.flush();
+            out.resize((size_t)empty.get_data_len());
+            APV2Encode encode(out.data() + out.size());
+            encode.flush();
+        } else {
+            size_t edges = INITIAL_POOL_BYTES / sizeof(APV2Cost) + 1;
+            APV2_parser parser(in.data(), in.size(), edges);
+            // the parser price is a Q16 fixed-point bit count
+            bits = (double)parser.parse(progress) / QFACTOR;
+            out.resize((size_t)apv2_encoder_get_data_len(parser));
+            apv2_encode_parse(out.data(), out.size(), parser);
+        }
+    } catch( const std::bad_alloc & ) {
+        progress_bar_done(); // get back to the user's screen before reporting
+        fprintf(stderr, "apv2: %s: out of memory\n", what.c_str());
+        return false;
+    }
+
+    // verify: the compressed data must decode back to the original input, byte for byte
+    APV2 decode;
+    std::vector<uint8_t> check(in.size());
+    bool verified = false;
+    try {
+        size_t decoded = decode.decompress(check.data(), out.data(), out.size());
+        verified = (decoded == in.size())
+            && (in.empty() || (memcmp(check.data(), in.data(), in.size()) == 0));
+    } catch( const rABS_error & ) {
+        verified = false;
+    }
+    if( !verified ) {
+        fprintf(stderr, "apv2: %s: internal error, compressed data failed verification\n", what.c_str());
+        return false;
+    }
+
+    if( !write_file(outFile, out.data(), out.size()) ) {
+        return false;
+    }
+
+    double ratio = in.empty() ? 0.0 : (double)out.size() * 100.0 / (double)in.size();
+    printf("%s: %.2f%% -- %s %.1f bit %zu B\n",
+           what.c_str(), ratio, outFile.string().c_str(), bits, out.size());
+    return true;
+}
+
+static bool decompress_file(const fs::path &inFile, const fs::path &outFile, const Options &opt)
+{
+    std::string what = inFile.string();
+    std::vector<uint8_t> in;
+    if( !read_file(inFile, in) ) {
+        return false;
+    }
+    if( !check_output_free(outFile, opt.force) ) {
+        return false;
+    }
+
+    // first pass only counts the decoded size, second pass fills the buffer
+    APV2 scan;
+    size_t outSize = 0;
+    try {
+        scan.decompress(NULL, in.data(), in.size());
+        outSize = scan.get_data_len();
+    } catch( const rABS_error & ) {
+        fprintf(stderr, "apv2: %s: corrupt input file\n", what.c_str());
+        return false;
+    }
+
+    std::vector<uint8_t> out(outSize);
+    APV2 decode;
+    size_t decoded = 0;
+    try {
+        decoded = decode.decompress(out.data(), in.data(), in.size());
+    } catch( const rABS_error & ) {
+        fprintf(stderr, "apv2: %s: corrupt input file\n", what.c_str());
+        return false;
+    }
+    if( decoded != outSize ) {
+        fprintf(stderr, "apv2: %s: corrupt input file\n", what.c_str());
+        return false;
+    }
+
+    if( !write_file(outFile, out.data(), out.size()) ) {
+        return false;
+    }
+
+    double ratio = outSize == 0 ? 0.0 : (double)in.size() * 100.0 / (double)outSize;
+    printf("%s: %.2f%% -- %s %zu B\n", what.c_str(), ratio, outFile.string().c_str(), outSize);
+    return true;
 }
 
 int main( int argc, char *args[] )
 {
-    int opt;
-    bool decompress = (!strcmp(args[0],"unapv2"))?true:false;
-    bool verbose = false;
-    ssize_t pool_size = 1024*1024*1024;
-    while ((opt = getopt_long(argc, args, short_options, long_options, NULL)) != -1) {
-        switch (opt) {
-        case 'd':
-            decompress = true;
-            break;
-        case 'p':
-            pool_size = atoi(optarg)*1024*1024;
-            break;
-        case 'v':
-            verbose = true;
-            break;
-        case 'V':
-            print_version();
-            return EXIT_SUCCESS;
-        case 'h':
-            /* fall through */
-        default:
-            usage(std::filesystem::path(args[0]));
-            return EXIT_SUCCESS;
-        }
-    }
+    Options opt;
+    opt.decompress = (fs::path(args[0]).filename().stem() == "unapv2");
 
-    if (argc == optind) {
-        fprintf(stderr, "%s: too few arguments.\n", args[0]);
-        usage(args[0]);
+    int firstFile = 1;
+    if( !parse_args(argc, args, opt, firstFile) ) {
         return EXIT_FAILURE;
     }
-    if( pool_size <= 0 ) {
-        fprintf(stderr, "%s: pool size needs to be greater than zero.\n", args[0]);
+    if( firstFile >= argc ) {
+        fprintf(stderr, "apv2: too few arguments\n");
+        usage(stderr, args[0]);
         return EXIT_FAILURE;
     }
 
-    char poolSizeBytes[8];
-    const char *Unit = "B";
-    humanize_number( poolSizeBytes, sizeof(poolSizeBytes), pool_size, Unit, HN_AUTOSCALE, 0);
-    if( verbose ) {
-        printf("initial memory pool size: %s\n", poolSizeBytes);
+    APV2Cost::maxSlots = opt.maxSlots;
+
+    // the progress bar redraws its line, so it only makes sense on a terminal
+    APV2_parser::progress_callback_t progress = NULL;
+    if( opt.verbose && console_columns() > 0 ) {
+        progress = print_progress;
+        progress_bar_init();
     }
 
-//    init_log2_table();
-    for( int j=optind; j<argc; ++j ) {
-        std::filesystem::path outFile = args[j];
-        std::filesystem::path inFile = args[j];
+    int status = EXIT_SUCCESS;
+    for( int j=firstFile; j<argc; ++j ) {
+        fs::path inFile(args[j]);
+        fs::path outFile(inFile);
 
-        if( !decompress && (inFile.extension() == ".apv2") ) {
-            fprintf(stderr, "%s: %s already has .apv2 suffix -- unchanged\n", args[0], inFile.c_str());
+        if( !opt.decompress && inFile.extension() == ".apv2" ) {
+            fprintf(stderr, "apv2: %s already has .apv2 suffix -- unchanged\n", inFile.string().c_str());
+            continue; // like gzip: the file is already in the wanted form, not an error
+        }
+        if( opt.decompress && inFile.extension() != ".apv2" ) {
+            fprintf(stderr, "apv2: %s: unknown suffix -- ignored\n", inFile.string().c_str());
+            status = status < 2 ? 2 : status; // gzip exits 2 for a wrong suffix
             continue;
         }
-        if( decompress && (inFile.extension() != ".apv2") ) {
-            fprintf(stderr, "%s: %s: unknown suffix -- ignored\n", args[0], inFile.c_str());
-            continue;
-        }
-        if( decompress ) {
+        if( opt.decompress ) {
             outFile.replace_extension();
         } else {
             outFile += ".apv2";
         }
 
-        size_t inFileSize;
-        uint8_t *addr = mmap_file(inFile.c_str(), &inFileSize);
-        if( addr == NULL ) {
-            return EXIT_FAILURE;
+        bool ok = opt.decompress ? decompress_file(inFile, outFile, opt)
+                                 : compress_file(inFile, outFile, opt, progress);
+        if( !ok && status == EXIT_SUCCESS ) {
+            status = EXIT_FAILURE;
         }
-        uint8_t *outBuf = NULL;
-        size_t outFileSize = 0;
-        if( !decompress ) { // Compress
-            typedef Forward_arrivals_parse<APV2Cost> APV2_parser;
-            APV2_parser parser(addr, inFileSize, pool_size/sizeof(APV2Cost)+1);
-            APV2_parser::progress_callback_t progress = NULL;
-            if( verbose ) {
-                progress = print_progress;
-            }
-            size_t compressedBits = parser.parse(progress);
-            outFileSize = apv2_encoder_get_data_len(parser);
-            outBuf = new uint8_t[outFileSize];
-            apv2_encode_parse( outBuf, outFileSize, parser );
-            printf("%s:\t%3.2f\%% -- %s %f bit %zd B ", inFile.c_str(), ((float)outFileSize*100)/inFileSize, outFile.c_str(), QTOF(compressedBits), outFileSize);
-
-            // verify
-            uint8_t *verifyBuf = new uint8_t[inFileSize];
-            APV2 decode;
-            decode.decompress( verifyBuf, outBuf, outFileSize );
-            // force equality
-            for( size_t i=0; i<inFileSize; ++i ) {
-                if( verifyBuf[i]!=addr[i]) {
-                    printf("failed!\n");
-                    return EXIT_FAILURE;
-                }
-            }
-            printf("\n");
-            delete [] verifyBuf;
-        } else { // Decompress
-            outFileSize = apv2_decoder_get_data_len( addr, inFileSize );
-            outBuf = new uint8_t[outFileSize];
-            APV2 decode;
-            decode.decompress( outBuf, addr, inFileSize );
-            printf("%s:\t%3.2f\%% -- %s %zu B\n", inFile.c_str(), ((float)inFileSize*100)/outFileSize, outFile.c_str(), outFileSize);
-        }
-        dump_to_file( outFile.c_str(), outBuf, outFileSize);
-        unmap_file(addr, inFileSize);
-        delete [] outBuf;
     }
-    return EXIT_SUCCESS;
+    return status;
 }
-

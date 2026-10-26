@@ -36,6 +36,36 @@
 
 #include <stddef.h>
 
+/*
+ * Columns of the terminal attached to stdout, 0 when stdout is not a
+ * terminal. Querying it on every redraw is also how a resized terminal is
+ * picked up. The OS call differs per platform, hence the one #ifdef in the
+ * codebase (see progress_bar.cpp); failing the call doubles as the tty check.
+ */
+unsigned console_columns(void);
+
+/*
+ * 1 when ANSI escapes may be printed to stdout, 0 for plain-text only.
+ * Windows consoles only became real terminals with Windows 10 and need a
+ * one-time mode flag; the same platform block as above covers it.
+ */
+int console_ansi(void);
+
+/*
+ * Ends the progress display: the last bar frame is kept as an ordinary
+ * output line and the cursor moves below it. Any code that may abort
+ * parsing and print a message afterwards should call it first so the
+ * message starts on a free line. Idempotent.
+ */
+void progress_bar_done(void);
+
+/*
+ * Call once from main when the progress bar will be used: while a bar is
+ * on screen, Ctrl+C (or SIGTERM) ends it cleanly - the terminal is left
+ * with the bar as a finished line - before the process dies.
+ */
+void progress_bar_init(void);
+
 void print_progress(size_t count, size_t max, size_t poolLevel, size_t poolSize);
 
 #endif /* PROGRESS_BAR_H_ */
