@@ -36,6 +36,7 @@
 
 #include <boost/intrusive/list.hpp>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -47,9 +48,6 @@
 
 #define USE_ESA_MATCHFINDERx
 #define DEBUG_PARSEx
-
-#define likely(x)      __builtin_expect(!!(x), 1)
-#define unlikely(x)    __builtin_expect(!!(x), 0)
 
 using namespace boost::intrusive;
 
@@ -111,13 +109,19 @@ public:
 #else
         mf = matchfinder_create(dataSize, /* max_offset */ Cost::maxOffset, /*min_match_length*/ Cost::minMatch, /*max_match_length*/ Cost::maxMatch);
 #endif
-        assert( mf != NULL );
+        if( mf == NULL ) {
+            fprintf(stderr, "apv2: cannot allocate matchfinder\n");
+            exit(EXIT_FAILURE);
+        }
 #ifdef USE_ESA_MATCHFINDER
         int32_t ret = esa_matchfinder_parse(mf, data, dataSize);
 #else
         int32_t ret = matchfinder_parse(mf, data, dataSize);
-        (void)(ret);
-        assert ( ret == 0 );
+        if( ret != 0 ) {
+            // a broken suffix array would silently produce a broken parse
+            fprintf(stderr, "apv2: suffix array construction failed\n");
+            exit(EXIT_FAILURE);
+        }
 #endif
     }
 
@@ -135,12 +139,14 @@ public:
     }
 
     void find_slot( typename Cost::List &list, Cost &key, size_t np ) {
+        max_pos = np;
+#if 1
         Cost &current_worst = list.back();
         if( (nbrEdges[np] > (unsigned)Cost::maxSlots) && (key.price > current_worst.price) ) {
             return;
         }
-
-        if (unlikely(list.empty())) {
+#endif
+        if( list.empty() ) {
             Cost &newItem = allocEdge();
             newItem = key;
             newItem.slot->ref++;
@@ -153,15 +159,14 @@ public:
         // is there someone already better than us?
         bool exists = false;
 
-        int key_prev_opcode = key.slot->encode.op;
         unsigned nbr_slots = 0;
         for( Cost &item : list ) {
-            int item_prev_opcode = item.slot->encode.op;
             // if better exists already, don't bother
             if((item.price <= key.price)
-               && (key_prev_opcode == item_prev_opcode)
-               && (item.score <= key.score)
-               && (item.isRepSetEqual(key)))
+                && (item.score <= key.score)
+                && (item.lastOffset == key.lastOffset)
+                && (item.encode.op == key.encode.op)
+                && (item.slot->encode.op == key.slot->encode.op))
             {
                 exists = true;
                 break;
@@ -276,11 +281,17 @@ public:
 #else
         matchfinder_match_t matches[Cost::maxOffset];
 #endif
-
-        for( size_t p=0; p<dataSize; ++p ) {
+        max_pos = 0;
+        forward_arrival_literal( 0, first );
+        for( size_t p=1; p<dataSize; ++p ) {
             // progress tracking if available
             if( progress != NULL )
                 progress( p+1, dataSize, sizeof(Cost)*allocLevel, sizeof(Cost)*poolSize );
+
+            if( costs[p].empty() ) {
+                continue;
+            }
+
 #ifdef USE_ESA_MATCHFINDER
             ESA_MATCHFINDER_MATCH *matchptr = esa_matchfinder_find_all_matches(mf, matches);
             uint32_t total_matches = matchptr-matches;
@@ -288,10 +299,10 @@ public:
             uint32_t total_matches = matchfinder_find_all_matches(mf, p, matches);
 #endif
 
-            if( costs[p].empty() ) {
-                continue;
+            if( p == max_pos ) {
+                purgePosition(p);
             }
-
+            size_t low_entropy_skip = 0;
             size_t block_remaining = std::min<size_t>(Cost::maxMatch, dataSize-p);
             for (Cost &from_slot : costs[p]) {
                 for (uint32_t j = 0; j < total_matches; ++j) {
@@ -311,23 +322,47 @@ public:
                     if( match->length > Cost::maxMatch ) {
                         length = Cost::maxMatch;
                     }
+                    if((length>match->offset) && (length == Cost::maxMatch)) {
+                        low_entropy_skip = length-1;
+                    }
                     // test for repeat matches
                     if( slot > -1 ) {
-                        for (size_t i = minMatch; i <= (size_t)length; ++i) {
-                            forward_arrival_rep_match(p, from_slot, i, slot);
-                            forward_arrival_match(p, from_slot, i, offset);
+                        /* Jump sampling for rep matches */
+                        int l = minMatch;
+                        for(; (l<=22) && (l<=length); ++l) {
+                            forward_arrival_rep_match(p, from_slot, l, slot);
                         }
+                        for(l=32; (l<=length); l<<=1) {
+                            forward_arrival_rep_match(p, from_slot, l, slot);
+                        }
+                        // Only call max if not already sampled (length > 22 and not PoT)
+                        if( length > 22 && (length & (length - 1)) != 0 ) {
+                            forward_arrival_rep_match(p, from_slot, length, slot);
+                        }
+                        // only test match at max length
+                        forward_arrival_match(p, from_slot, length, offset);
                         continue;
                     }
+
                     // test for normal matches
-                    for (size_t i = minMatch; i <= (size_t)length; ++i) {
-                        forward_arrival_match(p, from_slot, i, offset);
+                    int l = minMatch;
+                    for(; (l<=22) && (l<=length); ++l) {
+                        forward_arrival_match(p, from_slot, l, offset);
+                    }
+                    for(l=32; (l<=length); l<<=1) {
+                        forward_arrival_match(p, from_slot, l, offset);
+                    }
+                    // Only call max if not already sampled (length > 22 and not PoT)
+                    if( length > 22 && (length & (length - 1)) != 0 ) {
+                        forward_arrival_match(p, from_slot, length, offset);
                     }
                 }
                 // and finally the literals
                 forward_arrival_literal(p, from_slot);
             }
-
+            if( low_entropy_skip > 0 ) {
+                p += low_entropy_skip;
+            }
             if( allocLevel < lowLevel ) {
                 purgePosition(p);
                 if( allocLevel < lowLevel ) {
@@ -462,7 +497,7 @@ private:
     }
 
     Cost &allocEdge() {
-        if( unlikely(free_list.empty()) ) {
+        if( free_list.empty() ) {
             allocPool();
         }
 
@@ -501,6 +536,8 @@ private:
     size_t allocLevel;
     size_t lowLevel;
     size_t poolSize;
+    size_t max_pos;
+
     size_t chunkSize;
     std::vector<Cost *> edgePool;
     typename Cost::List free_list;

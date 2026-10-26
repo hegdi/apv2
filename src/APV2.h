@@ -167,6 +167,9 @@ private:
     prob_t offsetModel[4096];
 };
 
+// width of the parser's beam of live states per position
+#define DEFAULT_MAX_SLOTS (61)
+
 class APV2Cost {
     typedef uint8_t prob_t;
 public:
@@ -259,8 +262,7 @@ public:
     }
 
     bool inline isRepSetEqual( APV2Cost &other ) {
-        return (lastOffset == other.lastOffset)
-                && (!memcmp(&encode, &other.encode, sizeof(encode_t)));
+        return lastOffset == other.lastOffset;
     }
 
     int isOffsetInSet( uint32_t value ) {
@@ -305,7 +307,7 @@ public:
     unsigned lastOffset;
 
     static const int maxRepSlots = 1;
-    static const int maxSlots = 61; // prime, cause we can!
+    inline static int maxSlots = DEFAULT_MAX_SLOTS; // prime, cause we can!
     static const int maxMatch = 255;
     static const int minMatch = 1;
     static const int maxOffset = 4095;
